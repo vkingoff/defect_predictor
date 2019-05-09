@@ -10,7 +10,22 @@ import json
 from bisect import bisect_left, bisect_right
 import numpy as np
 import pickle
+import requests
+import os
+import shutil
 
+SAVE_CHUNK_SIZE = 50
+np.set_printoptions(precision = 3)
+
+# setup zmq client
+context = zmq.Context()
+socket = context.socket(zmq.REQ)
+socket.connect("tcp://127.0.0.1:5557")
+
+words_to_search = ['bug', 'fix', 'refactor', 'error', 'fail']
+repos_list=['axios/axios',
+            'atom/atom',
+            'facebook/react']
 
 def dump(obj):
   for attr in dir(obj):
@@ -82,102 +97,116 @@ def check_and_add_functions_metrics(metrics, f_metrics_a, f_metrics_b):
 
   return metrics
 
-def save_data(metrics):
+def iter_javascript_repositories(ind):
+  url = 'https://api.github.com/search/repositories'
+  for page in range(1, 2):
+    params = dict(
+      q=ind+'language:javascript'
+    )
+    response = requests.get(url, params=params).json()
+    if not response['items']:
+      break
+    yield from response['items']
+
+
+def save_data(metrics, prefix):
   print("Dump %s metrics." % (len(metrics)))
   np_metrics = np.asarray(metrics)
-  with open('metrics.pkl', 'wb') as f:
+  with open(os.path.join('result', '{}_metrics.pkl'.format(prefix)), 'wb') as f:
     pickle.dump(np_metrics, f)
 
-#
-# main code
-#
-SAVE_CHUNK_SIZE = 50
-save_limit = SAVE_CHUNK_SIZE
-
-np.set_printoptions(precision = 3)
-metrics = []
-
-# setup zmq client
-context = zmq.Context()
-socket = context.socket(zmq.REQ)
-socket.connect("tcp://127.0.0.1:5557")
-
-repo = Repo('data/atom')
-words_to_search = ['bug', 'fix', 'refactor', 'error', 'fail']
-
-commits = list(repo.iter_commits('master', reverse=True))
-prev_commit = commits[0]
-for commit in commits[1:]:
-  commit_message_lines = commit.message.splitlines()
-  if not commit_message_lines:
-    continue
-
-  commit_message_frist_line = commit_message_lines[0].lower()
-  diffs = []
-  if any(findWholeWord(x)(commit_message_frist_line) for x in words_to_search):
-    diff_index = prev_commit.diff(commit, create_patch=True)
-    for diff in diff_index.iter_change_type('M'):
-      if diff.a_path[-3:] == ".js":
-        diffs.append(diff)
-
-  if diffs:
-    print(commit_message_frist_line)
-    for d in diffs:
-      a_path = "--- " + d.a_rawpath.decode('utf-8')
-      b_path = "+++ " + d.b_rawpath.decode('utf-8')
-
-      # Get detailed info
-      patch = PatchSet(a_path + os.linesep + b_path + os.linesep + d.diff.decode('utf-8'))
-
-      # Parse old file
-      socket.send(d.a_blob.data_stream.read())
-      report = socket.recv()
-      metrics_a = json.loads(report.decode('utf-8'))
-      if "error" in metrics_a:
-        print("error: %s" % (metrics_a["error"]))
-        continue
-      functions_a = metrics_a["functions"]
-      funcs_line_a = [f["line"] for f in functions_a]
-
-      # Parse new file
-      socket.send(d.b_blob.data_stream.read())
-      report = socket.recv()
-      metrics_b = json.loads(report.decode('utf-8'))
-      if "error" in metrics_b:
-        print("error: %s" % (metrics_b["error"]))
-        continue
-      functions_b = metrics_b["functions"]
-      funcs_line_b = [f["line"] for f in functions_b]
-
-      for h in patch[0]:
-        try:
-          for l in h:
-            if (l.source_line_no is not None
-                and l.target_line_no is not None):
-
-              ind_a = find_function_at_line(funcs_line_a, l.source_line_no)
-              f_metrics_a = functions_a[ind_a]
-
-              ind_b = find_function_at_line(funcs_line_b, l.target_line_no)
-              f_metrics_b = functions_b[ind_b]
-
-              if "seen" in functions_a[ind_a] or "seen" in functions_b[ind_b]:
-                continue
-
-              metrics = check_and_add_functions_metrics(metrics, f_metrics_a, f_metrics_b)
-              functions_a[ind_a]["seen"] = True
-              functions_b[ind_b]["seen"] = True
-
-        except ValueError:
+def сollect_repository_metrics():
+  save_limit = SAVE_CHUNK_SIZE
+  for ind in repos_list:
+    for repository in iter_javascript_repositories(ind):
+      print('Cloning {}'.format(repository['full_name']))
+      path = os.path.join('data', repository['full_name'])
+      shutil.rmtree(path, ignore_errors=True)
+      repo = Repo.clone_from(repository['clone_url'], path, branch=repository['default_branch'])
+      prefix = repository['full_name'].replace('/', '_')
+      #
+      # main code
+      #
+      metrics = []
+      commits = list(repo.iter_commits(repository['default_branch'], reverse=True))
+      prev_commit = commits[0]
+      for commit in commits[1:]:
+        commit_message_lines = commit.message.splitlines()
+        if not commit_message_lines:
           continue
 
-      print("")
+        commit_message_frist_line = commit_message_lines[0].lower()
+        diffs = []
+        if any(findWholeWord(x)(commit_message_frist_line) for x in words_to_search):
+          diff_index = prev_commit.diff(commit, create_patch=True)
+          for diff in diff_index.iter_change_type('M'):
+            if diff.a_path[-3:] == ".js":
+              diffs.append(diff)
 
-  prev_commit = commit
+        if diffs:
+          print(commit_message_frist_line)
+          for d in diffs:
+            a_path = "--- " + d.a_rawpath.decode('utf-8')
+            b_path = "+++ " + d.b_rawpath.decode('utf-8')
 
-  if len(metrics) > save_limit:
-    save_data(metrics)
-    save_limit += SAVE_CHUNK_SIZE
+            # Get detailed info
+            try:
+              patch = PatchSet(a_path + os.linesep + b_path + os.linesep + d.diff.decode('utf-8'))
+            except UnicodeDecodeError:
+              continue
 
-save_data(metrics)
+            # Parse old file
+            socket.send(d.a_blob.data_stream.read())
+            report = socket.recv()
+            metrics_a = json.loads(report.decode('utf-8'))
+            if "error" in metrics_a:
+              print("error: %s" % (metrics_a["error"]))
+              continue
+            functions_a = metrics_a["functions"]
+            funcs_line_a = [f["line"] for f in functions_a]
 
+            # Parse new file
+            socket.send(d.b_blob.data_stream.read())
+            report = socket.recv()
+            metrics_b = json.loads(report.decode('utf-8'))
+            if "error" in metrics_b:
+              print("error: %s" % (metrics_b["error"]))
+              continue
+            functions_b = metrics_b["functions"]
+            funcs_line_b = [f["line"] for f in functions_b]
+
+            for h in patch[0]:
+              try:
+                for l in h:
+                  if (l.source_line_no is not None
+                      and l.target_line_no is not None):
+
+                    ind_a = find_function_at_line(funcs_line_a, l.source_line_no)
+                    f_metrics_a = functions_a[ind_a]
+
+                    ind_b = find_function_at_line(funcs_line_b, l.target_line_no)
+                    f_metrics_b = functions_b[ind_b]
+
+                    if "seen" in functions_a[ind_a] or "seen" in functions_b[ind_b]:
+                      continue
+
+                    metrics = check_and_add_functions_metrics(metrics, f_metrics_a, f_metrics_b)
+                    functions_a[ind_a]["seen"] = True
+                    functions_b[ind_b]["seen"] = True
+
+              except ValueError:
+                continue
+
+            print("")
+
+        prev_commit = commit
+
+        if len(metrics) > save_limit:
+          save_data(metrics, prefix)
+          save_limit += SAVE_CHUNK_SIZE
+      shutil.rmtree(path, ignore_errors=True)
+
+      save_data(metrics, prefix)
+
+if __name__ == '__main__':
+  сollect_repository_metrics()
