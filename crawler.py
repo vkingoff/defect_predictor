@@ -22,10 +22,9 @@ context = zmq.Context()
 socket = context.socket(zmq.REQ)
 socket.connect("tcp://127.0.0.1:5557")
 
-words_to_search = ['bug', 'fix', 'refactor', 'error', 'fail']
-repos_list=['axios/axios',
-            'atom/atom',
-            'facebook/react']
+words_to_search = ['fix']
+repos_list=['twbs/bootstrap',
+            'airbnb/javascript']
 
 def dump(obj):
   for attr in dir(obj):
@@ -101,7 +100,9 @@ def iter_javascript_repositories(ind):
   url = 'https://api.github.com/search/repositories'
   for page in range(1, 2):
     params = dict(
-      q=ind+'language:javascript'
+      q=ind+'language:javascript',
+      per_page='1',
+      page=page
     )
     response = requests.get(url, params=params).json()
     if not response['items']:
